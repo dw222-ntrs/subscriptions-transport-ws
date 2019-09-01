@@ -71,6 +71,7 @@ export interface ClientOptions {
 export class SubscriptionClient {
   public client: any;
   public operations: Operations;
+  private chunks: any;
   private url: string;
   private nextOperationId: number;
   private connectionParams: Function;
@@ -120,6 +121,7 @@ export class SubscriptionClient {
     this.connectionCallback = connectionCallback;
     this.url = url;
     this.operations = {};
+    this.chunks = {};
     this.nextOperationId = 0;
     this.wsTimeout = timeout;
     this.unsentMessagesQueue = [];
@@ -461,7 +463,32 @@ export class SubscriptionClient {
   }
 
   // send message, or queue it if connection is not open
-  private sendMessageRaw(message: Object) {
+  private sendMessageRaw(message: any) {
+
+     // implementation of custom message sent from NT WebSocket.
+     switch(message.type) {
+      case 'start':
+        const newMessage = {
+          ...message,
+          ...message.payload,
+          metadata: {
+            id: message.id
+          }
+        }
+        newMessage.graphql = typeof newMessage.graphql === 'string' ? newMessage.graphql:  newMessage.query;
+        delete(newMessage.query);
+        delete(newMessage.payload);
+        message = newMessage;
+        break;
+      case 'connection_init':
+      case 'stop':
+        return;
+      default: 
+        // This is only for error debugging. 
+        console.info("Ignore message type", message.type);
+        return;
+    }
+
     switch (this.status) {
       case this.wsImpl.OPEN:
         let serializedMessage: string = JSON.stringify(message);
@@ -588,9 +615,53 @@ export class SubscriptionClient {
 
     try {
       parsedMessage = JSON.parse(receivedData);
-      opId = parsedMessage.id;
+      opId = parsedMessage.id || parsedMessage.metadata.id;
     } catch (e) {
       throw new Error(`Message must be JSON-parseable. Got: ${receivedData}`);
+    }
+
+
+    // implementation of custom message received from NT WebSocket.
+    if (parsedMessage.action === 'graphql') {
+      const { totalParts, part, guid } = parsedMessage.metadata;
+      let dataToDecode = '';
+      let decodeData = false;
+
+      if (totalParts === 1) {
+        dataToDecode = parsedMessage.data;
+        decodeData = true;
+      } else {
+        this.chunks[opId] = this.chunks[opId] || {};
+        this.chunks[opId][part] = parsedMessage.data;
+        const receivedPartsSize = Object.keys(this.chunks[opId]).length;
+        if (receivedPartsSize === totalParts) {
+          for (let key in this.chunks[opId]) {
+            dataToDecode += this.chunks[opId][key];
+          }
+          decodeData = true;
+          delete(this.chunks[opId]);
+        }
+      }
+
+      if (decodeData) {
+        try {
+          const parsedPayload = { data: JSON.parse(decodeURIComponent(dataToDecode))};
+          this.operations[opId].handler(null, parsedPayload);
+          delete this.operations[opId];
+        } catch (err) {
+          console.info(`could not parse ${guid} dataSet`, err);
+        }
+      }
+      return;
+    }
+
+
+    if (parsedMessage.backChannel === true) {
+      const { dataSetKey } = parsedMessage;
+      this.operations[opId].options.setContext({dataSetKey });
+      this.operations[opId].handler(this.formatErrors({ message: "BackChannel used", type: 'backChannelUsed' }), null);
+      delete this.operations[opId];
+      return;
     }
 
     if (
